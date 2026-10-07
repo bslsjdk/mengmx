@@ -1,0 +1,41 @@
+name: build-paged-mmap
+
+on:
+  push:
+    branches: [android-paged-mmap]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout patch repo
+        uses: actions/checkout@v4
+
+      - name: Clone llama.cpp v0.6.0
+        run: git clone --depth 1 --branch v0.6.0 https://github.com/ggml-org/llama.cpp.git llama.cpp
+
+      - name: Apply Android sparse lazy-mmap patch
+        run: python3 patch_paged_mmap.py
+
+      - name: Configure
+        run: cmake -S llama.cpp -B llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DGGML_OPENMP=OFF -DGGML_VULKAN=OFF -DGGML_OPENCL=OFF -DGGML_NATIVE=OFF
+
+      - name: Build llama-cli
+        run: cmake --build llama.cpp/build --target llama-cli -j2
+
+      - name: Package source
+        run: |
+          mkdir -p package/llama.cpp-android-paged-mmap-v0.6.0
+          cp -a llama.cpp/. package/llama.cpp-android-paged-mmap-v0.6.0/
+          cp patch_paged_mmap.py package/llama.cpp-android-paged-mmap-v0.6.0/
+          cp build_v060.sh package/llama.cpp-android-paged-mmap-v0.6.0/
+          cd package
+          zip -r ../llama.cpp-android-paged-mmap-v0.6.0.zip llama.cpp-android-paged-mmap-v0.6.0
+
+      - name: Upload ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama.cpp-android-paged-mmap-v0.6.0
+          path: llama.cpp-android-paged-mmap-v0.6.0.zip
+          retention-days: 30
