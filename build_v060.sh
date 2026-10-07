@@ -11,7 +11,7 @@ cp "$HERE/patch_paged_mmap.py" "$ROOT/patch_paged_mmap.py"
 cd "$ROOT"
 python patch_paged_mmap.py
 cd "$SRC"
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_OPENMP=OFF -DGGML_VULKAN=OFF -DGGML_OPENCL=OFF -DGGML_NATIVE=OFF
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_OPENMP=OFF -DGGML_VULKAN=OFF -DGGML_OPENCL=OFF -DGGML_NATIVE=OFF
 cmake --build build --target llama-cli -j2
 echo
 echo "===== BUILD OK ====="
