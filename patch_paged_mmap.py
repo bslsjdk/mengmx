@@ -217,7 +217,7 @@ bool llama_mmap::is_segmented() const {
     return pimpl->segmented;
 }
 '''
-    if "addr_at(size_t offset)" not in s:
+    if "void * llama_mmap::addr_at(size_t offset) const" not in s:
         if marker_pub not in s:
             raise SystemExit("PATCH FAILED: mmap public API")
         s = s.replace(marker_pub, marker_pub + "\n" + insert_pub, 1)
