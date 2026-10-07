@@ -15,7 +15,7 @@ fi
 # The source tree contains generated experimental patches. Always restore the
 # tracked v0.6.0 mmap source before applying the current patch.
 cd "$SRC"
-git restore --source=HEAD -- src/llama-mmap.cpp
+git restore --source=HEAD -- src/llama-mmap.cpp src/llama-mmap.h src/llama-model-loader.cpp src/llama-model.cpp
 
 cp "$HERE/patch_paged_mmap.py" "$ROOT/patch_paged_mmap.py"
 cd "$ROOT"
