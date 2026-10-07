@@ -74,19 +74,41 @@ if "ANDROID_CONTIGUOUS_VA_V5" not in s:
 # Add a registry for clean file-backed page eviction. Use void* in the global
 # registry so the private nested impl type never appears in a free-function
 # declaration. Member code performs the cast and accesses the private fields.
-if "ANDROID_RSS_TRIM_V2" not in s:
+if "ANDROID_RSS_TRIM_V3" not in s:
     marker = "struct llama_mmap::impl {"
     if marker not in s:
         raise SystemExit("PATCH FAILED: RSS trim impl marker")
 
-    prefix = r"""// ANDROID_RSS_TRIM_V2
+    prefix = r"""// ANDROID_RSS_TRIM_V3
+#include <atomic>
+#include <chrono>
 #include <mutex>
+#include <thread>
 static std::mutex g_android_mmap_mutex;
 static std::vector<void *> g_android_mmaps;
+static std::atomic<bool> g_android_trim_running{false};
+
+static void android_trim_worker() {
+    while (g_android_trim_running.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (g_android_trim_running.load(std::memory_order_relaxed)) {
+            llama_mmap::trim_all();
+        }
+    }
+}
+
+static void android_start_trim_worker() {
+    bool expected = false;
+    if (g_android_trim_running.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+        std::thread(android_trim_worker).detach();
+    }
+}
 
 static void android_register_mmap(void * p) {
     std::lock_guard<std::mutex> lock(g_android_mmap_mutex);
     g_android_mmaps.push_back(p);
+    android_start_trim_worker();
 }
 
 static void android_unregister_mmap(void * p) {
@@ -94,6 +116,9 @@ static void android_unregister_mmap(void * p) {
     auto it = std::find(g_android_mmaps.begin(), g_android_mmaps.end(), p);
     if (it != g_android_mmaps.end()) {
         g_android_mmaps.erase(it);
+    }
+    if (g_android_mmaps.empty()) {
+        g_android_trim_running.store(false, std::memory_order_release);
     }
 }
 
@@ -208,4 +233,4 @@ if "ANDROID_CONTIGUOUS_VA_V5_LOADER" not in s:
     )
     p.write_text(s)
 
-print("PATCH COMPLETE: Android contiguous VA V5 + resident-page trim V2")
+print("PATCH COMPLETE: Android contiguous VA V5 + resident-page trim V3 background")
