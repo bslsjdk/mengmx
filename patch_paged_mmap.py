@@ -3,45 +3,43 @@ from pathlib import Path
 
 ROOT = Path("llama.cpp")
 
-def patch_file(rel, old, new, tag):
+def replace_once(rel, old, new, tag):
     p = ROOT / rel
     s = p.read_text()
     if tag in s:
         return
     if old not in s:
-        raise SystemExit(f"PATCH FAILED: {tag}: source pattern not found in {rel}")
+        raise SystemExit(f"PATCH FAILED: {tag}")
     p.write_text(s.replace(old, new, 1))
 
-# llama-mmap.h: expose offset -> actual virtual address translation.
-patch_file(
+replace_once(
     "src/llama-mmap.h",
-    """    size_t size() const;
+    '''    size_t size() const;
     void * addr() const;
 
     void unmap_fragment(size_t first, size_t last);
-""",
-    """    size_t size() const;
+''',
+    '''    size_t size() const;
     void * addr() const;
     void * addr_at(size_t offset) const;
     bool is_segmented() const;
 
     void unmap_fragment(size_t first, size_t last);
-""",
+''',
     "ANDROID_SEGMENTED_MMAP_API",
 )
 
-# llama-mmap.cpp: independently map 256 MiB file windows. No giant virtual
-# reservation is attempted, because Android rejected even the reservation.
 p = ROOT / "src/llama-mmap.cpp"
 s = p.read_text()
+
 if "ANDROID_SEGMENTED_MMAP_IMPL" not in s:
-    old = """        addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
+    old = '''        addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
         if (addr == MAP_FAILED) {
             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
         }
 
         // page-aligned madvise over [beg, end), clamped to the file
-"""
+'''
     new = r'''        // ANDROID_SEGMENTED_MMAP_IMPL
         const size_t page_size = (size_t) sysconf(_SC_PAGESIZE);
         const size_t map_chunk = ((size_t) 256 * 1024 * 1024) & ~(page_size - 1);
@@ -86,14 +84,14 @@ if "ANDROID_SEGMENTED_MMAP_IMPL" not in s:
         // page-aligned madvise over [beg, end), clamped to the file
 '''
     if old not in s:
-        raise SystemExit("PATCH FAILED: mmap constructor pattern")
-    s=s.replace(old,new,1)
+        raise SystemExit("PATCH FAILED: mmap constructor")
+    s = s.replace(old, new, 1)
 
-    old_members="""    std::vector<std::pair<size_t, size_t>> mapped_fragments;
+    old_members = '''    std::vector<std::pair<size_t, size_t>> mapped_fragments;
 
     impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
-"""
-    new_members="""    struct segment {
+'''
+    new_members = '''    struct segment {
         size_t first;
         size_t last;
         void * addr;
@@ -104,15 +102,15 @@ if "ANDROID_SEGMENTED_MMAP_IMPL" not in s:
     bool segmented = false;
 
     impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
-"""
+'''
     if old_members not in s:
-        raise SystemExit("PATCH FAILED: mmap impl members")
-    s=s.replace(old_members,new_members,1)
+        raise SystemExit("PATCH FAILED: mmap members")
+    s = s.replace(old_members, new_members, 1)
 
-    old_unmap="""    void unmap_fragment(size_t first, size_t last) {
+    old_unmap = '''    void unmap_fragment(size_t first, size_t last) {
         int page_size = sysconf(_SC_PAGESIZE);
-"""
-    new_unmap=r'''    void * addr_at(size_t offset) const {
+'''
+    new_unmap = r'''    void * addr_at(size_t offset) const {
         if (!segmented) {
             GGML_ASSERT(offset < size);
             return (char *) addr + offset;
@@ -149,8 +147,7 @@ if "ANDROID_SEGMENTED_MMAP_IMPL" not in s:
                 void * cut_addr = (char *) seg.addr + (cut_first - seg.first);
 
                 if (cut_len && munmap(cut_addr, cut_len)) {
-                    LLAMA_LOG_WARN("warning: munmap failed: %s
-", strerror(errno));
+                    LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
                 }
 
                 if (seg.first < cut_first) {
@@ -176,12 +173,18 @@ if "ANDROID_SEGMENTED_MMAP_IMPL" not in s:
         int page_size = sysconf(_SC_PAGESIZE);
 '''
     if old_unmap not in s:
-        raise SystemExit("PATCH FAILED: mmap unmap function")
-    s=s.replace(old_unmap,new_unmap,1)
+        raise SystemExit("PATCH FAILED: mmap unmap")
+    s = s.replace(old_unmap, new_unmap, 1)
 
-    import re
-    old_des_re = re.compile(r"    ~impl\\(\\) \\{\\n        for \\(const auto & frag : mapped_fragments\\) \\{\\n            if \\(munmap\\(\\(char \\*\\) addr \\+ frag\\.first, frag\\.second - frag\\.first\\)\\) \\{\\n                LLAMA_LOG_WARN\\(\\"warning: munmap failed: %s\\\\n\\", strerror\\(errno\\)\\);\\n            \\}\\n        \\}\\n    \\}\\n")
-    new_des = """    ~impl() {
+    old_des = '''    ~impl() {
+        for (const auto & frag : mapped_fragments) {
+            if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
+                LLAMA_LOG_WARN("warning: munmap failed: %s\\n", strerror(errno));
+            }
+        }
+    }
+'''
+    new_des = '''    ~impl() {
         if (segmented) {
             for (const auto & seg : segments) {
                 if (munmap(seg.addr, seg.last - seg.first)) {
@@ -197,7 +200,48 @@ if "ANDROID_SEGMENTED_MMAP_IMPL" not in s:
             }
         }
     }
-"""
-    if not old_des_re.search(s):
+'''
+    if old_des not in s:
         raise SystemExit("PATCH FAILED: mmap destructor")
-    s=old_des_re.sub(new_des, s, count=1)
+    s = s.replace(old_des, new_des, 1)
+
+    old_pub = '''void * llama_mmap::addr() const {
+    return pimpl->addr;
+}
+
+void llama_mmap::unmap_fragment(size_t first, size_t last) {
+'''
+    new_pub = '''void * llama_mmap::addr() const {
+    return pimpl->addr;
+}
+
+void * llama_mmap::addr_at(size_t offset) const {
+    return pimpl->addr_at(offset);
+}
+
+bool llama_mmap::is_segmented() const {
+    return pimpl->segmented;
+}
+
+void llama_mmap::unmap_fragment(size_t first, size_t last) {
+'''
+    if old_pub not in s:
+        raise SystemExit("PATCH FAILED: mmap public API")
+    s = s.replace(old_pub, new_pub, 1)
+    p.write_text(s)
+
+replace_once(
+    "src/llama-model-loader.cpp",
+    "data = (const uint8_t *) mappings.at(w.idx)->addr() + w.offs + offs;",
+    "data = (const uint8_t *) mappings.at(w.idx)->addr_at(w.offs + offs);",
+    "ANDROID_SEGMENTED_MMAP_LOADER",
+)
+
+replace_once(
+    "src/llama-model-loader.cpp",
+    "uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;",
+    "uint8_t * data = (uint8_t *) mapping->addr_at(weight->offs);",
+    "ANDROID_SEGMENTED_MMAP_LOADER2",
+)
+
+print("PATCH COMPLETE: Android segmented mmap V4")
