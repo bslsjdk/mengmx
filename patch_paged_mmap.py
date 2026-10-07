@@ -3,8 +3,8 @@ from pathlib import Path
 
 ROOT = Path("llama.cpp")
 
-def replace_once(rel, old, new, tag):
-    p = ROOT / rel
+def replace_once(path, old, new, tag):
+    p = ROOT / path
     s = p.read_text()
     if tag in s:
         return
@@ -12,39 +12,21 @@ def replace_once(rel, old, new, tag):
         raise SystemExit(f"PATCH FAILED: {tag}")
     p.write_text(s.replace(old, new, 1))
 
-# V5: keep one contiguous virtual address range per GGUF shard, but back it
-# with 256 MiB file mappings. The address space is reserved with PROT_NONE
-# anonymous MAP_NORESERVE, so the 4-5 GiB virtual range does not mean 4-5 GiB
-# of resident RAM. File pages are faulted in on demand.
-replace_once(
-    "src/llama-mmap.h",
-    """    size_t size() const;
-    void * addr() const;
-
-    void unmap_fragment(size_t first, size_t last);
-""",
-    """    size_t size() const;
-    void * addr() const;
-
-    void unmap_fragment(size_t first, size_t last);
-""",
-    "ANDROID_CONTIGUOUS_VA_V5_API",
-)
-
+# V5: one contiguous virtual address range per GGUF shard, populated by
+# 256 MiB file-backed mappings. MAP_NORESERVE keeps the VA reservation from
+# implying an equal amount of resident RAM.
 p = ROOT / "src/llama-mmap.cpp"
 s = p.read_text()
 
-old = """        addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
+if "ANDROID_CONTIGUOUS_VA_V5" not in s:
+    old = """        addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
         if (addr == MAP_FAILED) {
             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
         }
 
         // page-aligned madvise over [beg, end), clamped to the file
 """
-new = r"""        // ANDROID_CONTIGUOUS_VA_V5
-        // Reserve one contiguous virtual range, then replace it with file-backed
-        // mappings in chunks. This preserves the single-base-pointer invariant
-        // expected by ggml while avoiding one giant file mmap on Android/FUSE.
+    new = r"""        // ANDROID_CONTIGUOUS_VA_V5
         const size_t page_size = (size_t) sysconf(_SC_PAGESIZE);
         const size_t map_chunk = ((size_t) 256 * 1024 * 1024) & ~(page_size - 1);
 
@@ -60,8 +42,6 @@ new = r"""        // ANDROID_CONTIGUOUS_VA_V5
         }
 
         addr = reserved;
-        reserved_base = reserved;
-        reserved_size = file->size();
 
         for (size_t first = 0; first < file->size(); first += map_chunk) {
             const size_t len = std::min(map_chunk, file->size() - first);
@@ -70,19 +50,13 @@ new = r"""        // ANDROID_CONTIGUOUS_VA_V5
             map_flags |= MAP_NORESERVE;
 #endif
             void * mapped = mmap(
-                (char *) reserved + first,
-                len,
-                PROT_READ,
-                map_flags,
-                fd,
-                (off_t) first);
+                (char *) reserved + first, len, PROT_READ,
+                map_flags, fd, (off_t) first);
 
             if (mapped == MAP_FAILED || mapped != (char *) reserved + first) {
                 const int saved_errno = errno;
                 munmap(reserved, file->size());
                 addr = nullptr;
-                reserved_base = nullptr;
-                reserved_size = 0;
                 throw std::runtime_error(format(
                     "contiguous file mapping failed at %zu..%zu: %s",
                     first, first + len, strerror(saved_errno)));
@@ -93,56 +67,30 @@ new = r"""        // ANDROID_CONTIGUOUS_VA_V5
 
         // page-aligned madvise over [beg, end), clamped to the file
 """
-if "ANDROID_CONTIGUOUS_VA_V5" not in s:
     if old not in s:
         raise SystemExit("PATCH FAILED: mmap V5 constructor")
     s = s.replace(old, new, 1)
 
-# No extra state is required for cleanup: mapped_fragments contains the
-# file-backed pieces occupying the reserved contiguous virtual range.
-if "ANDROID_CONTIGUOUS_VA_V5_MEMBERS" not in s:
-    marker = "    std::vector<std::pair<size_t, size_t>> mapped_fragments;\n"
-    if marker not in s:
-        raise SystemExit("PATCH FAILED: mmap V5 members")
-    s = s.replace(
-        marker,
-        marker + "    // ANDROID_CONTIGUOUS_VA_V5_MEMBERS\n",
-        1,
-    )
+# Restore the public mmap API to the upstream v0.6.0 form.
+p.write_text(s)
 
-# The original advise lambda already uses one contiguous addr, which is now
-# exactly what V5 guarantees. Keep it unchanged.
-
-old_unmap = """    void unmap_fragment(size_t first, size_t last) {
-        int page_size = sysconf(_SC_PAGESIZE);
-"""
-new_unmap = r"""    void unmap_fragment(size_t first, size_t last) {
-        int page_size = sysconf(_SC_PAGESIZE);
-"""
-# Keep the original implementation. Its address arithmetic is valid because
-# V5 deliberately preserves a contiguous virtual address range.
-
-# The upstream destructor already unmaps every mapped fragment. Because
-# V5 keeps every fragment inside one contiguous VA reservation, that cleanup
-# remains correct.\n\np.write_text(s)
-
-# Restore the loader to normal contiguous-address semantics. V5 intentionally
-# provides one contiguous virtual address range, so no addr_at indirection is
-# required and the existing ggml host-buffer path can remain intact.
-for rel, bad, good, tag in [
-    (
-        "src/llama-model-loader.cpp",
-        "data = (const uint8_t *) mappings.at(w.idx)->addr_at(w.offs + offs);",
-        "data = (const uint8_t *) mappings.at(w.idx)->addr() + w.offs + offs;",
-        "ANDROID_CONTIGUOUS_VA_V5_LOADER1",
-    ),
-    (
-        "src/llama-model-loader.cpp",
-        "uint8_t * data = (uint8_t *) mapping->addr_at(weight->offs);",
-        "uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;",
-        "ANDROID_CONTIGUOUS_VA_V5_LOADER2",
-    ),
+# V5 intentionally preserves a contiguous virtual address range, so the
+# existing loader pointer arithmetic is correct. No segmented addr_at API.
+for path, marker in [
+    ("src/llama-model-loader.cpp", "ANDROID_CONTIGUOUS_VA_V5_LOADER"),
 ]:
-    replace_once(rel, bad, good, tag)
+    p = ROOT / path
+    s = p.read_text()
+    if marker not in s:
+        # Remove only the V4 addr_at substitutions if present.
+        s = s.replace(
+            "mappings.at(w.idx)->addr_at(w.offs + offs)",
+            "mappings.at(w.idx)->addr() + w.offs + offs",
+        )
+        s = s.replace(
+            "mapping->addr_at(weight->offs)",
+            "mapping->addr() + weight->offs",
+        )
+        p.write_text(s)
 
 print("PATCH COMPLETE: Android contiguous virtual-address lazy mmap V5")
