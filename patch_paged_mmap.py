@@ -179,19 +179,13 @@ if "ANDROID_SEGMENTED_MMAP_IMPL" not in s:
         raise SystemExit("PATCH FAILED: mmap unmap function")
     s=s.replace(old_unmap,new_unmap,1)
 
-    old_des="""    ~impl() {
-        for (const auto & frag : mapped_fragments) {
-            if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
-                LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
-            }
-        }
-    }
-"""
-    new_des="""    ~impl() {
+    import re
+    old_des_re = re.compile(r"    ~impl\\(\\) \\{\\n        for \\(const auto & frag : mapped_fragments\\) \\{\\n            if \\(munmap\\(\\(char \\*\\) addr \\+ frag\\.first, frag\\.second - frag\\.first\\)\\) \\{\\n                LLAMA_LOG_WARN\\(\\"warning: munmap failed: %s\\\\n\\", strerror\\(errno\\)\\);\\n            \\}\\n        \\}\\n    \\}\\n")
+    new_des = """    ~impl() {
         if (segmented) {
             for (const auto & seg : segments) {
                 if (munmap(seg.addr, seg.last - seg.first)) {
-                    LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
+                    LLAMA_LOG_WARN("warning: munmap failed: %s\\n", strerror(errno));
                 }
             }
             return;
@@ -199,112 +193,11 @@ if "ANDROID_SEGMENTED_MMAP_IMPL" not in s:
 
         for (const auto & frag : mapped_fragments) {
             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
-                LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
+                LLAMA_LOG_WARN("warning: munmap failed: %s\\n", strerror(errno));
             }
         }
     }
 """
-    if old_des not in s:
+    if not old_des_re.search(s):
         raise SystemExit("PATCH FAILED: mmap destructor")
-    s=s.replace(old_des,new_des,1)
-
-    old_pub="""void * llama_mmap::addr() const {
-    return pimpl->addr;
-}
-
-void llama_mmap::unmap_fragment(size_t first, size_t last) {
-"""
-    new_pub="""void * llama_mmap::addr() const {
-    return pimpl->addr;
-}
-
-void * llama_mmap::addr_at(size_t offset) const {
-    return pimpl->addr_at(offset);
-}
-
-bool llama_mmap::is_segmented() const {
-    return pimpl->segmented;
-}
-
-void llama_mmap::unmap_fragment(size_t first, size_t last) {
-"""
-    if old_pub not in s:
-        raise SystemExit("PATCH FAILED: mmap public methods")
-    s=s.replace(old_pub,new_pub,1)
-    p.write_text(s)
-
-# Loader: use translated addresses instead of assuming one contiguous mapping.
-patch_file(
-    "src/llama-model-loader.cpp",
-    "data = (const uint8_t *) mappings.at(w.idx)->addr() + w.offs + offs;",
-    "data = (const uint8_t *) mappings.at(w.idx)->addr_at(w.offs + offs); // ANDROID_SEGMENTED_MMAP_LOADER",
-    "ANDROID_SEGMENTED_MMAP_LOADER",
-)
-patch_file(
-    "src/llama-model-loader.cpp",
-    "uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;",
-    "uint8_t * data = (uint8_t *) mapping->addr_at(weight->offs); // ANDROID_SEGMENTED_MMAP_LOADER2",
-    "ANDROID_SEGMENTED_MMAP_LOADER2",
-)
-
-# Model: for segmented mmap, create one zero-copy host buffer per tensor.
-# This avoids asking ggml to construct one giant host buffer spanning gaps.
-mp = ROOT / "src/llama-model.cpp"
-s = mp.read_text()
-tag="ANDROID_SEGMENTED_MMAP_BUFFERS"
-if tag not in s:
-    old="""            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
-                // only the mmap region containing the tensors in the model is mapped to the backend buffer
-"""
-    new=r'''            // ANDROID_SEGMENTED_MMAP_BUFFERS
-            // A segmented mapping has no single contiguous host address range.
-            // Bind each tensor directly to its mapped file range instead.
-            bool handled_segmented = false;
-            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
-                if (!ml.mappings.at(idx)->is_segmented()) {
-                    continue;
-                }
-                handled_segmented = true;
-                for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor != nullptr; tensor = ggml_get_next_tensor(ctx, tensor)) {
-                    const auto * weight = ml.get_weight(ggml_get_name(tensor));
-                    if (!weight || weight->idx != idx) {
-                        continue;
-                    }
-                    const size_t tensor_size = ggml_nbytes(tensor);
-                    void * tensor_addr = ml.mappings.at(idx)->addr_at(weight->offs);
-                    ggml_backend_buffer_t tensor_buf = ggml_backend_dev_buffer_from_host_ptr(
-                        dev, tensor_addr, tensor_size, tensor_size);
-                    if (tensor_buf == nullptr) {
-                        throw std::runtime_error(format("unable to allocate segmented host buffer for tensor %s", ggml_get_name(tensor)));
-                    }
-                    ggml_backend_tensor_alloc(tensor_buf, tensor, tensor_addr);
-                    bufs.emplace_back(tensor_buf);
-                }
-            }
-
-            if (handled_segmented) {
-                // Tensor buffers are already bound to their mmap addresses.
-                // load_all_data will therefore avoid allocating model-sized RAM.
-            } else {
-            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
-                // only the mmap region containing the tensors in the model is mapped to the backend buffer
-'''
-    if old not in s:
-        raise SystemExit("PATCH FAILED: model buffer loop")
-    s=s.replace(old,new,1)
-    old_end="""                buf_map.emplace(idx, buf);
-            }
-        } else {
-"""
-    new_end="""                buf_map.emplace(idx, buf);
-            }
-            }
-        } else {
-"""
-    # replace the first matching close belonging to the host-ptr loop
-    if old_end not in s:
-        raise SystemExit("PATCH FAILED: model buffer loop close")
-    s=s.replace(old_end,new_end,1)
-    mp.write_text(s)
-
-print("PATCH COMPLETE: Android segmented mmap V3")
+    s=old_des_re.sub(new_des, s, count=1)
