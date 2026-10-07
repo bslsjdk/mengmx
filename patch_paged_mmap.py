@@ -205,29 +205,22 @@ if "ANDROID_SEGMENTED_MMAP_IMPL" not in s:
         raise SystemExit("PATCH FAILED: mmap destructor")
     s = s.replace(old_des, new_des, 1)
 
-    old_pub = '''void * llama_mmap::addr() const {
+    marker_pub = '''void * llama_mmap::addr() const {
     return pimpl->addr;
 }
-
-void llama_mmap::unmap_fragment(size_t first, size_t last) {
 '''
-    new_pub = '''void * llama_mmap::addr() const {
-    return pimpl->addr;
-}
-
-void * llama_mmap::addr_at(size_t offset) const {
+    insert_pub = '''void * llama_mmap::addr_at(size_t offset) const {
     return pimpl->addr_at(offset);
 }
 
 bool llama_mmap::is_segmented() const {
     return pimpl->segmented;
 }
-
-void llama_mmap::unmap_fragment(size_t first, size_t last) {
 '''
-    if old_pub not in s:
-        raise SystemExit("PATCH FAILED: mmap public API")
-    s = s.replace(old_pub, new_pub, 1)
+    if "addr_at(size_t offset)" not in s:
+        if marker_pub not in s:
+            raise SystemExit("PATCH FAILED: mmap public API")
+        s = s.replace(marker_pub, marker_pub + "\n" + insert_pub, 1)
     p.write_text(s)
 
 replace_once(
