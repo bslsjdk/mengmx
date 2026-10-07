@@ -98,20 +98,17 @@ if "ANDROID_CONTIGUOUS_VA_V5" not in s:
         raise SystemExit("PATCH FAILED: mmap V5 constructor")
     s = s.replace(old, new, 1)
 
-old_members = """    std::vector<std::pair<size_t, size_t>> mapped_fragments;
-
-    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
-"""
-new_members = """    std::vector<std::pair<size_t, size_t>> mapped_fragments;
-    void * reserved_base = nullptr;
-    size_t reserved_size = 0;
-
-    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
-"""
-if "void * reserved_base" not in s:
-    if old_members not in s:
+# No extra state is required for cleanup: mapped_fragments contains the
+# file-backed pieces occupying the reserved contiguous virtual range.
+if "ANDROID_CONTIGUOUS_VA_V5_MEMBERS" not in s:
+    marker = "    std::vector<std::pair<size_t, size_t>> mapped_fragments;\n"
+    if marker not in s:
         raise SystemExit("PATCH FAILED: mmap V5 members")
-    s = s.replace(old_members, new_members, 1)
+    s = s.replace(
+        marker,
+        marker + "    // ANDROID_CONTIGUOUS_VA_V5_MEMBERS\n",
+        1,
+    )
 
 # The original advise lambda already uses one contiguous addr, which is now
 # exactly what V5 guarantees. Keep it unchanged.
@@ -125,35 +122,9 @@ new_unmap = r"""    void unmap_fragment(size_t first, size_t last) {
 # Keep the original implementation. Its address arithmetic is valid because
 # V5 deliberately preserves a contiguous virtual address range.
 
-old_des = """    ~impl() {
-        for (const auto & frag : mapped_fragments) {
-            if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
-                LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
-            }
-        }
-    }
-"""
-new_des = """    ~impl() {
-        if (reserved_base != nullptr) {
-            if (munmap(reserved_base, reserved_size)) {
-                LLAMA_LOG_WARN("warning: munmap contiguous VA reservation failed: %s\n", strerror(errno));
-            }
-            return;
-        }
-
-        for (const auto & frag : mapped_fragments) {
-            if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
-                LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
-            }
-        }
-    }
-"""
-if "munmap contiguous VA reservation failed" not in s:
-    if old_des not in s:
-        raise SystemExit("PATCH FAILED: mmap V5 destructor")
-    s = s.replace(old_des, new_des, 1)
-
-p.write_text(s)
+# The upstream destructor already unmaps every mapped fragment. Because
+# V5 keeps every fragment inside one contiguous VA reservation, that cleanup
+# remains correct.\n\np.write_text(s)
 
 # Restore the loader to normal contiguous-address semantics. V5 intentionally
 # provides one contiguous virtual address range, so no addr_at indirection is
