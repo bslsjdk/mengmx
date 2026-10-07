@@ -3,10 +3,13 @@ set -euo pipefail
 ROOT="$HOME/mengmx-build"
 SRC="$ROOT/llama.cpp"
 HERE="$(cd "$(dirname "$0")" && pwd)"
-rm -rf "$ROOT"
 mkdir -p "$ROOT"
-echo "==> cloning llama.cpp v0.6.0"
-git clone --depth 1 --branch v0.6.0 https://github.com/ggml-org/llama.cpp.git "$SRC"
+if [ ! -d "$SRC/.git" ]; then
+  echo "==> first build: cloning llama.cpp v0.6.0"
+  git clone --depth 1 --branch v0.6.0 https://github.com/ggml-org/llama.cpp.git "$SRC"
+else
+  echo "==> incremental build: reusing existing llama.cpp build"
+fi
 cp "$HERE/patch_paged_mmap.py" "$ROOT/patch_paged_mmap.py"
 cd "$ROOT"
 python patch_paged_mmap.py
