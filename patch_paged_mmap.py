@@ -18,9 +18,12 @@ replacement = """        int flags = MAP_SHARED;
 #endif
         if (numa) { prefetch = 0; }"""
 
-if needle not in s:
+if "flags |= MAP_NORESERVE;" in s:
+    print("PATCH ALREADY APPLIED: MAP_NORESERVE")
+elif needle in s:
+    s = s.replace(needle, replacement, 1)
+else:
     raise SystemExit("PATCH FAILED: mmap flags block not found in v0.6.0")
-s = s.replace(needle, replacement, 1)
 
 marker = '        addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);'
 if marker not in s:
