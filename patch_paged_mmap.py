@@ -12,222 +12,166 @@ def replace_once(rel, old, new, tag):
         raise SystemExit(f"PATCH FAILED: {tag}")
     p.write_text(s.replace(old, new, 1))
 
+# V5: keep one contiguous virtual address range per GGUF shard, but back it
+# with 256 MiB file mappings. The address space is reserved with PROT_NONE
+# anonymous MAP_NORESERVE, so the 4-5 GiB virtual range does not mean 4-5 GiB
+# of resident RAM. File pages are faulted in on demand.
 replace_once(
     "src/llama-mmap.h",
-    '''    size_t size() const;
+    """    size_t size() const;
     void * addr() const;
 
     void unmap_fragment(size_t first, size_t last);
-''',
-    '''    size_t size() const;
+""",
+    """    size_t size() const;
     void * addr() const;
-    void * addr_at(size_t offset) const;
-    bool is_segmented() const;
 
     void unmap_fragment(size_t first, size_t last);
-''',
-    "ANDROID_SEGMENTED_MMAP_API",
+""",
+    "ANDROID_CONTIGUOUS_VA_V5_API",
 )
 
 p = ROOT / "src/llama-mmap.cpp"
 s = p.read_text()
 
-if "ANDROID_SEGMENTED_MMAP_IMPL" not in s:
-    old = '''        addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
+old = """        addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
         if (addr == MAP_FAILED) {
             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
         }
 
         // page-aligned madvise over [beg, end), clamped to the file
-'''
-    new = r'''        // ANDROID_SEGMENTED_MMAP_IMPL
+"""
+new = r"""        // ANDROID_CONTIGUOUS_VA_V5
+        // Reserve one contiguous virtual range, then replace it with file-backed
+        // mappings in chunks. This preserves the single-base-pointer invariant
+        // expected by ggml while avoiding one giant file mmap on Android/FUSE.
         const size_t page_size = (size_t) sysconf(_SC_PAGESIZE);
         const size_t map_chunk = ((size_t) 256 * 1024 * 1024) & ~(page_size - 1);
 
-        struct segment {
-            size_t first;
-            size_t last;
-            void * addr;
-        };
+        int reserve_flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#ifdef MAP_NORESERVE
+        reserve_flags |= MAP_NORESERVE;
+#endif
+        void * reserved = mmap(NULL, file->size(), PROT_NONE, reserve_flags, -1, 0);
+        if (reserved == MAP_FAILED) {
+            throw std::runtime_error(format(
+                "contiguous virtual address reservation failed for %zu bytes: %s",
+                file->size(), strerror(errno)));
+        }
 
-        segments.clear();
-        segments.reserve((file->size() + map_chunk - 1) / map_chunk);
-        segmented = true;
+        addr = reserved;
+        reserved_base = reserved;
+        reserved_size = file->size();
 
         for (size_t first = 0; first < file->size(); first += map_chunk) {
             const size_t len = std::min(map_chunk, file->size() - first);
-            int map_flags = MAP_SHARED;
+            int map_flags = MAP_SHARED | MAP_FIXED;
 #ifdef MAP_NORESERVE
             map_flags |= MAP_NORESERVE;
 #endif
-            void * mapped = mmap(NULL, len, PROT_READ, map_flags, fd, (off_t) first);
-            if (mapped == MAP_FAILED) {
+            void * mapped = mmap(
+                (char *) reserved + first,
+                len,
+                PROT_READ,
+                map_flags,
+                fd,
+                (off_t) first);
+
+            if (mapped == MAP_FAILED || mapped != (char *) reserved + first) {
                 const int saved_errno = errno;
-                for (const auto & seg : segments) {
-                    munmap(seg.addr, seg.last - seg.first);
-                }
-                segments.clear();
-                segmented = false;
+                munmap(reserved, file->size());
+                addr = nullptr;
+                reserved_base = nullptr;
+                reserved_size = 0;
                 throw std::runtime_error(format(
-                    "segmented mmap failed at %zu..%zu: %s",
+                    "contiguous file mapping failed at %zu..%zu: %s",
                     first, first + len, strerror(saved_errno)));
             }
-            segments.push_back({ first, first + len, mapped });
-        }
 
-        addr = segments.empty() ? nullptr : segments.front().addr;
-        mapped_fragments.clear();
-        for (const auto & seg : segments) {
-            mapped_fragments.emplace_back(seg.first, seg.last);
+            mapped_fragments.emplace_back(first, first + len);
         }
 
         // page-aligned madvise over [beg, end), clamped to the file
-'''
+"""
+if "ANDROID_CONTIGUOUS_VA_V5" not in s:
     if old not in s:
-        raise SystemExit("PATCH FAILED: mmap constructor")
+        raise SystemExit("PATCH FAILED: mmap V5 constructor")
     s = s.replace(old, new, 1)
 
-    old_members = '''    std::vector<std::pair<size_t, size_t>> mapped_fragments;
+old_members = """    std::vector<std::pair<size_t, size_t>> mapped_fragments;
 
     impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
-'''
-    new_members = '''    struct segment {
-        size_t first;
-        size_t last;
-        void * addr;
-    };
-
-    std::vector<std::pair<size_t, size_t>> mapped_fragments;
-    std::vector<segment> segments;
-    bool segmented = false;
+"""
+new_members = """    std::vector<std::pair<size_t, size_t>> mapped_fragments;
+    void * reserved_base = nullptr;
+    size_t reserved_size = 0;
 
     impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
-'''
+"""
+if "void * reserved_base" not in s:
     if old_members not in s:
-        raise SystemExit("PATCH FAILED: mmap members")
+        raise SystemExit("PATCH FAILED: mmap V5 members")
     s = s.replace(old_members, new_members, 1)
 
-    old_unmap = '''    void unmap_fragment(size_t first, size_t last) {
+# The original advise lambda already uses one contiguous addr, which is now
+# exactly what V5 guarantees. Keep it unchanged.
+
+old_unmap = """    void unmap_fragment(size_t first, size_t last) {
         int page_size = sysconf(_SC_PAGESIZE);
-'''
-    new_unmap = r'''    void * addr_at(size_t offset) const {
-        if (!segmented) {
-            GGML_ASSERT(offset < size);
-            return (char *) addr + offset;
-        }
-        for (const auto & seg : segments) {
-            if (offset >= seg.first && offset < seg.last) {
-                return (char *) seg.addr + (offset - seg.first);
-            }
-        }
-        throw std::runtime_error(format("segmented mmap offset %zu is not mapped", offset));
-    }
-
-    void unmap_fragment(size_t first, size_t last) {
-        if (segmented) {
-            const size_t page_size = (size_t) sysconf(_SC_PAGESIZE);
-            first &= ~(page_size - 1);
-            last = std::min((last + page_size - 1) & ~(page_size - 1), size);
-            if (first >= last) {
-                return;
-            }
-
-            std::vector<segment> keep;
-            keep.reserve(segments.size());
-
-            for (const auto & seg : segments) {
-                if (seg.last <= first || seg.first >= last) {
-                    keep.push_back(seg);
-                    continue;
-                }
-
-                const size_t cut_first = std::max(first, seg.first);
-                const size_t cut_last = std::min(last, seg.last);
-                const size_t cut_len = cut_last - cut_first;
-                void * cut_addr = (char *) seg.addr + (cut_first - seg.first);
-
-                if (cut_len && munmap(cut_addr, cut_len)) {
-                    LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
-                }
-
-                if (seg.first < cut_first) {
-                    keep.push_back({seg.first, cut_first, seg.addr});
-                }
-                if (cut_last < seg.last) {
-                    keep.push_back({
-                        cut_last,
-                        seg.last,
-                        (char *) seg.addr + (cut_last - seg.first)
-                    });
-                }
-            }
-
-            segments = std::move(keep);
-            mapped_fragments.clear();
-            for (const auto & seg : segments) {
-                mapped_fragments.emplace_back(seg.first, seg.last);
-            }
-            return;
-        }
-
+"""
+new_unmap = r"""    void unmap_fragment(size_t first, size_t last) {
         int page_size = sysconf(_SC_PAGESIZE);
-'''
-    if old_unmap not in s:
-        raise SystemExit("PATCH FAILED: mmap unmap")
-    s = s.replace(old_unmap, new_unmap, 1)
+"""
+# Keep the original implementation. Its address arithmetic is valid because
+# V5 deliberately preserves a contiguous virtual address range.
 
-    old_des = '''    ~impl() {
+old_des = """    ~impl() {
         for (const auto & frag : mapped_fragments) {
             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
-                LLAMA_LOG_WARN("warning: munmap failed: %s\\n", strerror(errno));
+                LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
             }
         }
     }
-'''
-    new_des = '''    ~impl() {
-        if (segmented) {
-            for (const auto & seg : segments) {
-                if (munmap(seg.addr, seg.last - seg.first)) {
-                    LLAMA_LOG_WARN("warning: munmap failed: %s\\n", strerror(errno));
-                }
+"""
+new_des = """    ~impl() {
+        if (reserved_base != nullptr) {
+            if (munmap(reserved_base, reserved_size)) {
+                LLAMA_LOG_WARN("warning: munmap contiguous VA reservation failed: %s\n", strerror(errno));
             }
             return;
         }
 
         for (const auto & frag : mapped_fragments) {
             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
-                LLAMA_LOG_WARN("warning: munmap failed: %s\\n", strerror(errno));
+                LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
             }
         }
     }
-'''
+"""
+if "munmap contiguous VA reservation failed" not in s:
     if old_des not in s:
-        raise SystemExit("PATCH FAILED: mmap destructor")
+        raise SystemExit("PATCH FAILED: mmap V5 destructor")
     s = s.replace(old_des, new_des, 1)
 
-    marker_pub = '''void * llama_mmap::addr() const { return pimpl->addr; }
-'''
-    insert_pub = '''void * llama_mmap::addr_at(size_t offset) const { return pimpl->addr_at(offset); }
-bool llama_mmap::is_segmented() const { return pimpl->segmented; }
-'''
-    if "void * llama_mmap::addr_at(size_t offset) const" not in s:
-        if marker_pub not in s:
-            raise SystemExit("PATCH FAILED: mmap public API")
-        s = s.replace(marker_pub, marker_pub + insert_pub, 1)
-    p.write_text(s)
+p.write_text(s)
 
-replace_once(
-    "src/llama-model-loader.cpp",
-    "data = (const uint8_t *) mappings.at(w.idx)->addr() + w.offs + offs;",
-    "data = (const uint8_t *) mappings.at(w.idx)->addr_at(w.offs + offs);",
-    "ANDROID_SEGMENTED_MMAP_LOADER",
-)
+# Restore the loader to normal contiguous-address semantics. V5 intentionally
+# provides one contiguous virtual address range, so no addr_at indirection is
+# required and the existing ggml host-buffer path can remain intact.
+for rel, bad, good, tag in [
+    (
+        "src/llama-model-loader.cpp",
+        "data = (const uint8_t *) mappings.at(w.idx)->addr_at(w.offs + offs);",
+        "data = (const uint8_t *) mappings.at(w.idx)->addr() + w.offs + offs;",
+        "ANDROID_CONTIGUOUS_VA_V5_LOADER1",
+    ),
+    (
+        "src/llama-model-loader.cpp",
+        "uint8_t * data = (uint8_t *) mapping->addr_at(weight->offs);",
+        "uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;",
+        "ANDROID_CONTIGUOUS_VA_V5_LOADER2",
+    ),
+]:
+    replace_once(rel, bad, good, tag)
 
-replace_once(
-    "src/llama-model-loader.cpp",
-    "uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;",
-    "uint8_t * data = (uint8_t *) mapping->addr_at(weight->offs);",
-    "ANDROID_SEGMENTED_MMAP_LOADER2",
-)
-
-print("PATCH COMPLETE: Android segmented mmap V4")
+print("PATCH COMPLETE: Android contiguous virtual-address lazy mmap V5")
