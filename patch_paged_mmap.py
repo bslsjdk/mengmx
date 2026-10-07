@@ -104,7 +104,7 @@ new = """struct llama_mmap::impl {
         // non-empty, keep the address space sparse and map fragments on demand.
         if (!lazy_ranges.empty()) {
             LLAMA_LOG_INFO("llama_mmap: Android sparse lazy mapping enabled for %.2f GiB\\n",
-                    size / (double) GiB);
+                    size / (1024.0 * 1024.0 * 1024.0));
             addr = nullptr;
             return;
         }
