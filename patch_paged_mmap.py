@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
 from pathlib import Path
-import re
 
 ROOT = Path("llama.cpp")
 p = ROOT / "src/llama-mmap.cpp"
 s = p.read_text()
 
-if "ANDROID_PAGED_MMAP_V2" in s:
-    print("PATCH ALREADY APPLIED: ANDROID_PAGED_MMAP_V2")
-    raise SystemExit(0)
+start = s.find("        // ANDROID_PAGED_MMAP_V2:")
+end_marker = "            mapped_fragments.emplace_back(0, file->size());"
+if end_marker not in s:
+    end_marker = "        mapped_fragments.emplace_back(0, file->size());"
 
-start = s.find("        int flags = MAP_SHARED;")
-end_marker = "        mapped_fragments.emplace_back(0, file->size());"
-end = s.find(end_marker, start)
+if start >= 0:
+    end = s.find(end_marker, start)
+    if end < 0:
+        raise SystemExit("PATCH FAILED: existing Android paged mmap block is malformed")
+    end += len(end_marker)
+else:
+    start = s.find("        int flags = MAP_SHARED;")
+    end = s.find(end_marker, start)
+    if start < 0 or end < 0:
+        raise SystemExit("PATCH FAILED: v0.6.0 mmap constructor block not found")
+    end += len(end_marker)
 
-if start < 0 or end < 0:
-    raise SystemExit("PATCH FAILED: v0.6.0 mmap constructor block not found")
-
-end += len(end_marker)
-
-replacement = r'''        // ANDROID_PAGED_MMAP_V2:
-        // A 4-5 GiB single mmap can be rejected by Android even when the
-        // pages are lazy. Reserve the virtual address range without backing
-        // it, then map only the requested tensor ranges into that address
-        // space. This preserves addr()+file_offset pointer arithmetic while
-        // avoiding one giant file-backed mmap.
+block = r'''        // ANDROID_PAGED_MMAP_V2:
+        // Android may reject one giant file-backed mmap. Reserve the virtual
+        // range and map only lazy tensor ranges into it.
         if (!lazy_ranges.empty()) {
             const size_t page_size = (size_t) sysconf(_SC_PAGESIZE);
             const size_t page_mask = page_size - 1;
@@ -90,14 +90,12 @@ replacement = r'''        // ANDROID_PAGED_MMAP_V2:
             for (const auto & r : merged) {
                 if (posix_madvise((char *) addr + r.first, r.second - r.first,
                                   POSIX_MADV_RANDOM)) {
-                    LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_RANDOM) failed: %s
-",
+                    LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_RANDOM) failed: %s\n",
                                    strerror(errno));
                 }
             }
 
-            LLAMA_LOG_INFO("Android paged mmap: file=%zu MiB, mapped=%zu fragments
-",
+            LLAMA_LOG_INFO("Android paged mmap: file=%zu MiB, mapped=%zu fragments\n",
                            file->size() / (1024 * 1024), merged.size());
         } else {
             int flags = MAP_SHARED;
@@ -107,8 +105,7 @@ replacement = r'''        // ANDROID_PAGED_MMAP_V2:
             if (numa) { prefetch = 0; }
 #ifdef __linux__
             if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
-                LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s
-",
+                LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
                         strerror(errno));
             }
             if (prefetch) { flags |= MAP_POPULATE; }
@@ -120,6 +117,6 @@ replacement = r'''        // ANDROID_PAGED_MMAP_V2:
             mapped_fragments.emplace_back(0, file->size());
         }'''
 
-s = s[:start] + replacement + s[end:]
+s = s[:start] + block + s[end:]
 p.write_text(s)
 print("PATCH COMPLETE: Android paged mmap V2")
