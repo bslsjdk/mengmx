@@ -3,7 +3,12 @@ name: build-paged-mmap
 on:
   push:
     branches: [android-paged-mmap]
+    paths-ignore:
+      - "llama.cpp-android-paged-mmap-v0.6.0.zip"
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -15,7 +20,7 @@ jobs:
       - name: Clone llama.cpp v0.6.0
         run: git clone --depth 1 --branch v0.6.0 https://github.com/ggml-org/llama.cpp.git llama.cpp
 
-      - name: Apply Android sparse lazy-mmap patch
+      - name: Apply Android mmap patch
         run: python3 patch_paged_mmap.py
 
       - name: Configure
@@ -26,16 +31,18 @@ jobs:
 
       - name: Package source
         run: |
+          rm -rf package
           mkdir -p package/llama.cpp-android-paged-mmap-v0.6.0
           cp -a llama.cpp/. package/llama.cpp-android-paged-mmap-v0.6.0/
           cp patch_paged_mmap.py package/llama.cpp-android-paged-mmap-v0.6.0/
           cp build_v060.sh package/llama.cpp-android-paged-mmap-v0.6.0/
           cd package
-          zip -r ../llama.cpp-android-paged-mmap-v0.6.0.zip llama.cpp-android-paged-mmap-v0.6.0
+          zip -qr ../llama.cpp-android-paged-mmap-v0.6.0.zip llama.cpp-android-paged-mmap-v0.6.0
 
-      - name: Upload ZIP artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: llama.cpp-android-paged-mmap-v0.6.0
-          path: llama.cpp-android-paged-mmap-v0.6.0.zip
-          retention-days: 30
+      - name: Commit ZIP into repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add llama.cpp-android-paged-mmap-v0.6.0.zip
+          git commit -m "[skip ci] add patched llama.cpp v0.6.0 ZIP"
+          git push origin HEAD:android-paged-mmap
